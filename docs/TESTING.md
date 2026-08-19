@@ -11,7 +11,7 @@ fixture、日志或仓库文件中。
 ```bash
 python -m unittest discover -s tests -p "test_*.py" -v
 python -m unittest discover \
-  -s plugins/codex-deepseek-bridge/skills/setup-deepseek-worker/tests \
+  -s plugins/codex-deepseek-subagent/skills/setup-deepseek-subagent/tests \
   -p "test_*.py" -v
 ```
 
@@ -38,16 +38,15 @@ CI 使用只读仓库权限，不注入 Provider 凭据，不执行付费 smoke 
 - 所有 JSON 与 TOML 文件能被标准解析器读取；
 - 插件 manifest、插件目录和 marketplace 条目名称一致；
 - manifest 使用严格语义版本，并只引用实际存在的 companion 文件；
-- 两个 Skill 的名称、目录、frontmatter 与 `agents/openai.yaml` 保持一致；
+- 两个 Skill 的名称、目录、frontmatter 与 `agents/openai.yaml` 保持一致，并都明确设置 `policy.allow_implicit_invocation: false`；
 - 仓库只发布一个 `deepseek_evidence_worker` Agent 身份；
-- bridge 协议 namespace 只有 `codex-deepseek-bridge/v1`；
-- Hook 同时具备 spawn 前拦截和 child 启动交付入口，且所有
+- bridge 协议 namespace 只有 `codex-deepseek-subagent/v1`；
+- Hook 同时具备原始用户 prompt 授权、spawn 前拦截和 child 启动交付入口；`UserPromptSubmit` 不使用 matcher，且所有
   `additionalContextLimit` 都是正整数；
 - 不出现旧实验角色名、常见真实 token 格式、私钥头或具体 API key 赋值；
 - CI 没有漏掉任何受支持操作系统或 Python 版本。
 
-这些是产品边界测试，不代替运行时协议测试。bridge 测试仍需覆盖任务大小限制、关联、
-并发、原子状态转换、过期、隔离、失败阻断和不确定交付；setup 测试仍需覆盖
+这些是产品边界测试，不代替运行时协议测试。bridge 测试仍需覆盖精确首 token（含前导空白）授权、句中提及和附带标点不授权、模型生成 marker 不授权、grant 不跨 turn/session/cwd、一次消费、UserPromptSubmit 重放、损坏/错配/非有限数 tombstone 持续阻断、任务大小限制、关联、并发、原子状态转换、过期、隔离、失败阻断和不确定交付；setup 测试仍需覆盖
 `plan/install/doctor/uninstall`、所有权验证、冲突保护、幂等与卸载安全。
 
 ## 付费 smoke test

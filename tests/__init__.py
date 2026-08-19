@@ -1,1 +1,1 @@
-"""Tests for the Codex DeepSeek Bridge repository."""
+"""Tests for the Codex DeepSeek Subagent repository."""

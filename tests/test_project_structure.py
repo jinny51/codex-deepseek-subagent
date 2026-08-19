@@ -13,10 +13,10 @@ except ModuleNotFoundError:  # Python 3.10 can still run the bridge-only tests.
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PLUGIN_NAME = "codex-deepseek-bridge"
+PLUGIN_NAME = "codex-deepseek-subagent"
 CANONICAL_ROLE = "deepseek_evidence_worker"
-CANONICAL_PROTOCOL = "codex-deepseek-bridge/v1"
-EXPECTED_SKILLS = {"delegate-deepseek-work", "setup-deepseek-worker"}
+CANONICAL_PROTOCOL = "codex-deepseek-subagent/v1"
+EXPECTED_SKILLS = {"use-deepseek-subagent", "setup-deepseek-subagent"}
 IGNORED_DIRS = {".git", ".mypy_cache", ".pytest_cache", ".venv", "__pycache__"}
 
 
@@ -120,6 +120,10 @@ class ProjectStructureTests(unittest.TestCase):
         for prompt in prompts:
             self.assertIsInstance(prompt, str)
             self.assertLessEqual(len(prompt), 128)
+        self.assertEqual(
+            {prompt.split(maxsplit=1)[0] for prompt in prompts},
+            {"$use-deepseek-subagent", "$setup-deepseek-subagent"},
+        )
         self.assertEqual(interface.get("capabilities"), ["Read", "Write"])
 
         for key in ("homepage", "repository"):
@@ -178,6 +182,15 @@ class ProjectStructureTests(unittest.TestCase):
                 self.assertIn("short_description:", interface_text)
                 self.assertIn("default_prompt:", interface_text)
                 self.assertIn(f"${metadata['name']}", interface_text)
+                policy_blocks = re.findall(
+                    r"(?ms)^policy:\s*\n((?:^[ \t]+.*(?:\n|$))*)",
+                    interface_text,
+                )
+                self.assertEqual(len(policy_blocks), 1, "Skill must declare one invocation policy")
+                self.assertRegex(
+                    policy_blocks[0],
+                    r"(?m)^\s+allow_implicit_invocation:\s*false\s*$",
+                )
                 self.assertNotIn("TODO", interface_text.upper())
 
         self.assertEqual(len(names), len(set(names)), "skill names must be unique")
@@ -199,7 +212,7 @@ class ProjectStructureTests(unittest.TestCase):
         corpus = "\n".join(text for _, text in repository_text())
         role_names = set(re.findall(r"\bdeepseek_[a-z0-9_]*worker\b", corpus))
         self.assertEqual(role_names, {CANONICAL_ROLE})
-        protocol_names = set(re.findall(r"\bcodex-deepseek-bridge/v[0-9]+\b", corpus))
+        protocol_names = set(re.findall(r"\bcodex-deepseek-subagent/v[0-9]+\b", corpus))
         self.assertEqual(protocol_names, {CANONICAL_PROTOCOL})
 
         forbidden_upstream_role = "v4" + "_flash_worker"
@@ -213,8 +226,18 @@ class ProjectStructureTests(unittest.TestCase):
         hooks_document = json.loads(hook_files[0].read_text(encoding="utf-8"))
         hooks = hooks_document.get("hooks")
         self.assertIsInstance(hooks, dict)
+        self.assertIn("UserPromptSubmit", hooks)
         self.assertIn("PreToolUse", hooks)
         self.assertIn("SubagentStart", hooks)
+
+        prompt_groups = hooks["UserPromptSubmit"]
+        self.assertIsInstance(prompt_groups, list)
+        self.assertTrue(prompt_groups)
+        self.assertEqual(
+            list(nested_values(prompt_groups, "matcher")),
+            [],
+            "UserPromptSubmit must inspect every raw user prompt without a matcher",
+        )
 
         limits = list(nested_values(hooks_document, "additionalContextLimit"))
         self.assertTrue(limits, "Hook definitions must declare bounded context output")

@@ -1,6 +1,19 @@
 {
-  "description": "Automatically bridge one bounded task into the DeepSeek evidence worker while preserving Codex native subagent lifecycle.",
+  "description": "Bridge one explicitly authorized, bounded task into the DeepSeek evidence worker while preserving Codex native subagent lifecycle.",
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/hooks/bridge.py\" hook",
+            "commandWindows": "py -3 -I -c \"import os,runpy,sys;sys.argv=['bridge.py','hook'];runpy.run_path(os.path.join(os.environ['PLUGIN_ROOT'],'hooks','bridge.py'),run_name='__main__')\"",
+            "timeout": 10,
+            "statusMessage": "Checking explicit DeepSeek delegation"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "^Agent$",

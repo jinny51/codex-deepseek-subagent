@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage the single Codex Agent file owned by Codex DeepSeek Bridge."""
+"""Manage the single Codex Agent file owned by Codex DeepSeek Subagent."""
 
 from __future__ import annotations
 
@@ -19,11 +19,11 @@ import tempfile
 from typing import Any
 
 
-OWNER = "codex-deepseek-bridge"
+OWNER = "codex-deepseek-subagent"
 ROLE_NAME = "deepseek_evidence_worker"
 TARGET_NAME = "deepseek-evidence-worker.toml"
-MANAGED_MARKER = "# codex-deepseek-bridge: managed-agent/v1"
-MANIFEST_PREFIX = "# codex-deepseek-bridge-ownership: "
+MANAGED_MARKER = "# codex-deepseek-subagent: managed-agent/v1"
+MANIFEST_PREFIX = "# codex-deepseek-subagent-ownership: "
 TEMPLATE_PATH = Path(__file__).resolve().parents[3] / "assets" / TARGET_NAME
 
 
@@ -76,7 +76,7 @@ def validate_agent_payload(payload: str) -> None:
         raise SetupFailure("Agent template contains an unsupported credential source")
     if 'developer_instructions = """' not in agent_section:
         raise SetupFailure("Agent template is missing developer instructions")
-    for required_text in ("codex-deepseek-bridge/v1", "transport_error", "do not call a tool"):
+    for required_text in ("codex-deepseek-subagent/v1", "transport_error", "do not call a tool"):
         if required_text not in agent_section:
             raise SetupFailure("Agent template lacks its fail-closed bridge contract")
 
@@ -300,7 +300,7 @@ def run_uninstall(target: Path, payload: str) -> int:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Manage the Codex DeepSeek Bridge evidence worker Agent file."
+        description="Manage the Codex DeepSeek Subagent evidence worker Agent file."
     )
     parser.add_argument("command", choices=("plan", "install", "doctor", "uninstall"))
     parser.add_argument(

@@ -5,10 +5,10 @@
   },
   "plugins": [
     {
-      "name": "codex-deepseek-bridge",
+      "name": "codex-deepseek-subagent",
       "source": {
         "source": "local",
-        "path": "./plugins/codex-deepseek-bridge"
+        "path": "./plugins/codex-deepseek-subagent"
       },
       "policy": {
         "installation": "AVAILABLE",

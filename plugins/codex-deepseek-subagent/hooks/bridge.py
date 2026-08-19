@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Provider-neutral task bridge for one Codex custom subagent role.
+"""Explicitly authorized task bridge for one Codex custom subagent role.
 
 The normal path is entirely lifecycle driven:
 
+* UserPromptSubmit records a body-free, one-use grant for an explicit skill call.
 * PreToolUse captures the plaintext ``spawn_agent`` message and reserves it.
 * SubagentStart claims the matching reservation and injects the assignment.
 
@@ -16,6 +17,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -27,16 +29,26 @@ import uuid
 
 
 ROLE = "deepseek_evidence_worker"
-PROTOCOL = "codex-deepseek-bridge/v1"
+DELEGATION_TOKEN = "$use-deepseek-subagent"
+PROTOCOL = "codex-deepseek-subagent/v1"
 SCHEMA = 1
 MAX_ASSIGNMENT_BYTES = 49_152
 MAX_STATE_BYTES = 112_640
 DEFAULT_TTL_SECONDS = 120
 MAX_TTL_SECONDS = 3_600
+# The grant is already bound to one parent turn and is consumed once.  Keep it
+# long enough for high-reasoning parents to decide and formulate a bounded job,
+# while still cleaning abandoned turns without retaining any prompt body.
+DEFAULT_GRANT_TTL_SECONDS = 900
+MAX_GRANT_TTL_SECONDS = 3_600
 LOCK_TIMEOUT_SECONDS = 3.0
 RECEIPT_RETENTION_SECONDS = 7 * 24 * 60 * 60
+CONSUMED_GRANT_RETENTION_SECONDS = RECEIPT_RETENTION_SECONDS
 STATE_DIR_NAME = "handoff-state"
-FALLBACK_DIR_NAME = "codex-deepseek-bridge"
+FALLBACK_DIR_NAME = "codex-deepseek-subagent"
+DELEGATION_TOKEN_RE = re.compile(
+    rf"^\s*{re.escape(DELEGATION_TOKEN)}(?:\s|$)"
+)
 
 if os.name == "nt":
     import msvcrt  # type: ignore[import-not-found]
@@ -60,7 +72,12 @@ def _compact_json(value: Any) -> str:
     # Hook stdout can inherit a legacy Windows console encoding such as cp1252.
     # ASCII-safe JSON preserves the original Unicode after parsing while making
     # every lifecycle response portable across Windows, WSL, macOS, and Linux.
-    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _emit(value: Any) -> None:
@@ -139,17 +156,42 @@ def _reservation_key(session_id: str, cwd: str) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
+def _grant_key(session_id: str, parent_turn_id: str, cwd: str) -> str:
+    """Bind explicit authority to exactly one parent turn and workspace."""
+
+    material = _compact_json([session_id, parent_turn_id, cwd, ROLE]).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
 def _ttl_seconds() -> int:
-    raw = os.environ.get("CODEX_DEEPSEEK_BRIDGE_TTL_SECONDS")
+    raw = os.environ.get("CODEX_DEEPSEEK_SUBAGENT_TTL_SECONDS")
     if raw is None:
         return DEFAULT_TTL_SECONDS
     try:
         value = int(raw)
     except ValueError as error:
-        raise BridgeError("CODEX_DEEPSEEK_BRIDGE_TTL_SECONDS must be an integer") from error
+        raise BridgeError("CODEX_DEEPSEEK_SUBAGENT_TTL_SECONDS must be an integer") from error
     if not 1 <= value <= MAX_TTL_SECONDS:
         raise BridgeError(
-            f"CODEX_DEEPSEEK_BRIDGE_TTL_SECONDS must be between 1 and {MAX_TTL_SECONDS}"
+            f"CODEX_DEEPSEEK_SUBAGENT_TTL_SECONDS must be between 1 and {MAX_TTL_SECONDS}"
+        )
+    return value
+
+
+def _grant_ttl_seconds() -> int:
+    raw = os.environ.get("CODEX_DEEPSEEK_SUBAGENT_GRANT_TTL_SECONDS")
+    if raw is None:
+        return DEFAULT_GRANT_TTL_SECONDS
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise BridgeError(
+            "CODEX_DEEPSEEK_SUBAGENT_GRANT_TTL_SECONDS must be an integer"
+        ) from error
+    if not 1 <= value <= MAX_GRANT_TTL_SECONDS:
+        raise BridgeError(
+            "CODEX_DEEPSEEK_SUBAGENT_GRANT_TTL_SECONDS must be between "
+            f"1 and {MAX_GRANT_TTL_SECONDS}"
         )
     return value
 
@@ -228,7 +270,14 @@ def state_root() -> Path:
 
 
 def _ensure_subdirs(root: Path) -> None:
-    for name in ("reservations", "claims", "receipts", "quarantine"):
+    for name in (
+        "grants",
+        "consumed-grants",
+        "reservations",
+        "claims",
+        "receipts",
+        "quarantine",
+    ):
         _prepare_private_root(root / name)
 
 
@@ -323,6 +372,17 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_nonfinite_constant(value: str) -> None:
+    raise InvalidReservation(f"non-finite JSON number is forbidden: {value}")
+
+
+def _parse_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise InvalidReservation(f"non-finite JSON number is forbidden: {value}")
+    return parsed
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_STATE_BYTES:
@@ -331,12 +391,25 @@ def _read_json(path: Path) -> dict[str, Any]:
         raise InvalidReservation("state file permissions or ownership are unsafe")
     try:
         with path.open("r", encoding="utf-8") as stream:
-            value = json.load(stream, object_pairs_hook=_reject_duplicate_keys)
+            value = json.load(
+                stream,
+                object_pairs_hook=_reject_duplicate_keys,
+                parse_constant=_reject_nonfinite_constant,
+                parse_float=_parse_finite_float,
+            )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise InvalidReservation("state file is not valid UTF-8 JSON") from error
     if not isinstance(value, dict):
         raise InvalidReservation("state document must be a JSON object")
     return value
+
+
+def _is_finite_json_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
 
 
 def _canonical_uuid(value: Any, field: str) -> str:
@@ -393,9 +466,9 @@ def _validate_reservation(value: dict[str, Any], *, now: float) -> dict[str, Any
         raise InvalidReservation("assignment digest does not match")
     created_at = value.get("created_at")
     expires_at = value.get("expires_at")
-    if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
+    if not _is_finite_json_number(created_at):
         raise InvalidReservation("created_at is invalid")
-    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+    if not _is_finite_json_number(expires_at):
         raise InvalidReservation("expires_at is invalid")
     if expires_at <= created_at or expires_at - created_at > MAX_TTL_SECONDS + 1:
         raise InvalidReservation("reservation lifetime is invalid")
@@ -405,6 +478,96 @@ def _validate_reservation(value: dict[str, Any], *, now: float) -> dict[str, Any
     if value["key_hash"] != expected_key:
         raise InvalidReservation("reservation attribution hash is invalid")
     return value
+
+
+def _validate_grant(value: dict[str, Any], *, now: float) -> dict[str, Any]:
+    if value.get("schema") != SCHEMA or value.get("bridge_protocol") != PROTOCOL:
+        raise InvalidReservation("grant schema or protocol is invalid")
+    _canonical_uuid(value.get("grant_id"), "grant_id")
+    try:
+        for field, maximum in (
+            ("key_hash", 64),
+            ("session_id", 512),
+            ("parent_turn_id", 512),
+            ("cwd", 4096),
+            ("role", 128),
+        ):
+            _canonical_id(value.get(field), field, maximum=maximum)
+    except BridgeError as error:
+        raise InvalidReservation(str(error)) from error
+    if value["role"] != ROLE:
+        raise InvalidReservation("grant role is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", value["key_hash"]):
+        raise InvalidReservation("grant key hash is invalid")
+    created_at = value.get("created_at")
+    expires_at = value.get("expires_at")
+    if not _is_finite_json_number(created_at):
+        raise InvalidReservation("grant created_at is invalid")
+    if not _is_finite_json_number(expires_at):
+        raise InvalidReservation("grant expires_at is invalid")
+    if expires_at <= created_at or expires_at - created_at > MAX_GRANT_TTL_SECONDS + 1:
+        raise InvalidReservation("grant lifetime is invalid")
+    if created_at > now + 30:
+        raise InvalidReservation("grant creation time is in the future")
+    expected_key = _grant_key(
+        value["session_id"], value["parent_turn_id"], value["cwd"]
+    )
+    if value["key_hash"] != expected_key:
+        raise InvalidReservation("grant attribution hash is invalid")
+    return value
+
+
+def _validate_consumed_grant(value: dict[str, Any], *, now: float) -> dict[str, Any]:
+    if value.get("schema") != SCHEMA or value.get("bridge_protocol") != PROTOCOL:
+        raise InvalidReservation("consumed grant schema or protocol is invalid")
+    _canonical_uuid(value.get("grant_id"), "grant_id")
+    try:
+        for field, maximum in (
+            ("key_hash", 64),
+            ("session_id", 512),
+            ("parent_turn_id", 512),
+            ("cwd", 4096),
+            ("role", 128),
+        ):
+            _canonical_id(value.get(field), field, maximum=maximum)
+    except BridgeError as error:
+        raise InvalidReservation(str(error)) from error
+    if value["role"] != ROLE:
+        raise InvalidReservation("consumed grant role is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", value["key_hash"]):
+        raise InvalidReservation("consumed grant key hash is invalid")
+    consumed_at = value.get("consumed_at")
+    if not _is_finite_json_number(consumed_at):
+        raise InvalidReservation("consumed_at is invalid")
+    if consumed_at > now + 30:
+        raise InvalidReservation("consumed_at is in the future")
+    expected_key = _grant_key(
+        value["session_id"], value["parent_turn_id"], value["cwd"]
+    )
+    if value["key_hash"] != expected_key:
+        raise InvalidReservation("consumed grant attribution hash is invalid")
+    return value
+
+
+def _read_consumed_grant(path: Path, *, now: float) -> dict[str, Any]:
+    value = _validate_consumed_grant(_read_json(path), now=now)
+    if value["key_hash"] != path.stem:
+        raise InvalidReservation("consumed grant does not match its exact key path")
+    return value
+
+
+def _consumed_grant_from_grant(grant: dict[str, Any], *, now: float) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA,
+        "bridge_protocol": PROTOCOL,
+        "grant_id": grant["grant_id"],
+        "key_hash": grant["key_hash"],
+        "session_id": grant["session_id"],
+        "parent_turn_id": grant["parent_turn_id"],
+        "cwd": grant["cwd"],
+        "role": grant["role"],
+        "consumed_at": now,
+    }
 
 
 def _quarantine(root: Path, path: Path, reason: str) -> str:
@@ -503,15 +666,165 @@ def _sweep_expired(root: Path, now: float, *, exclude: Path | None = None) -> No
             except FileNotFoundError:
                 pass
 
+    for path in (root / "grants").glob("*.json"):
+        if excluded is not None and path.resolve() == excluded:
+            continue
+        try:
+            value = _validate_grant(_read_json(path), now=now)
+        except (InvalidReservation, OSError):
+            continue
+        if value["expires_at"] > now:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    for path in (root / "consumed-grants").glob("*.json"):
+        try:
+            value = _read_consumed_grant(path, now=now)
+        except (InvalidReservation, OSError):
+            continue
+        if now - value["consumed_at"] <= CONSUMED_GRANT_RETENTION_SECONDS:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
 
 def _load_hook_input() -> dict[str, Any]:
     try:
-        value = json.load(sys.stdin, object_pairs_hook=_reject_duplicate_keys)
+        value = json.load(
+            sys.stdin,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite_constant,
+            parse_float=_parse_finite_float,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError, InvalidReservation) as error:
         raise BridgeError("hook input is not valid JSON") from error
     if not isinstance(value, dict):
         raise BridgeError("hook input must be a JSON object")
     return value
+
+
+def _emit_user_prompt_context(message: str) -> None:
+    _emit(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": message,
+            }
+        }
+    )
+
+
+def _user_prompt_submit(hook: dict[str, Any]) -> None:
+    """Record one body-free grant only for a top-level explicit invocation."""
+
+    # Subagent prompts are model-authored inputs, not direct user authority.
+    if hook.get("agent_id") is not None or hook.get("agent_type") is not None:
+        return
+    prompt = hook.get("prompt")
+    if not isinstance(prompt, str) or DELEGATION_TOKEN_RE.match(prompt) is None:
+        return
+
+    try:
+        session_id = _canonical_id(hook.get("session_id"), "session_id")
+        parent_turn_id = _canonical_id(hook.get("turn_id"), "turn_id")
+        cwd = _normalized_cwd(hook.get("cwd"))
+        permission_mode = _canonical_id(
+            hook.get("permission_mode"), "permission_mode", maximum=64
+        )
+        if permission_mode == "bypassPermissions":
+            raise BridgeError("explicit DeepSeek delegation is disabled under bypassPermissions")
+        now = time.time()
+        key_hash = _grant_key(session_id, parent_turn_id, cwd)
+        grant = {
+            "schema": SCHEMA,
+            "bridge_protocol": PROTOCOL,
+            "grant_id": str(uuid.uuid4()),
+            "key_hash": key_hash,
+            "session_id": session_id,
+            "parent_turn_id": parent_turn_id,
+            "cwd": cwd,
+            "role": ROLE,
+            "created_at": now,
+            "expires_at": now + _grant_ttl_seconds(),
+        }
+        root = state_root()
+        grant_path = root / "grants" / f"{key_hash}.json"
+        consumed_path = root / "consumed-grants" / f"{key_hash}.json"
+        prompt_context = (
+            "One explicit DeepSeek delegation is authorized for this user turn. "
+            "The grant permits at most one deepseek_evidence_worker spawn."
+        )
+        with _state_lock(root):
+            _cleanup_receipts(root, now)
+            _sweep_expired(root, now, exclude=grant_path)
+            if consumed_path.exists():
+                try:
+                    consumed = _read_consumed_grant(consumed_path, now=now)
+                except InvalidReservation as error:
+                    raise BridgeError(
+                        "the consumed-grant record is invalid and remains blocking at its exact key; "
+                        "inspect status and explicitly resolve-consumed before retrying"
+                    ) from error
+                if (
+                    consumed["key_hash"] != key_hash
+                    or consumed["session_id"] != session_id
+                    or consumed["parent_turn_id"] != parent_turn_id
+                    or consumed["cwd"] != cwd
+                    or consumed["role"] != ROLE
+                ):
+                    raise BridgeError(
+                        "the consumed-grant attribution is invalid and remains blocking at its "
+                        "exact key; explicitly resolve-consumed before retrying"
+                    )
+                # A crash may leave both records after the tombstone commit. The
+                # tombstone always wins, so remove the stale active copy.
+                if grant_path.exists():
+                    grant_path.unlink()
+                    _fsync_directory(grant_path.parent)
+                prompt_context = (
+                    "The explicit DeepSeek delegation grant for this user turn "
+                    "has already been consumed. Do not spawn deepseek_evidence_worker."
+                )
+            elif grant_path.exists():
+                try:
+                    existing = _validate_grant(_read_json(grant_path), now=now)
+                except InvalidReservation as error:
+                    _quarantine(root, grant_path, str(error))
+                    raise BridgeError(
+                        "existing delegation grant was quarantined; inspect bridge status before retrying"
+                    ) from error
+                if (
+                    existing["key_hash"] != key_hash
+                    or existing["session_id"] != session_id
+                    or existing["parent_turn_id"] != parent_turn_id
+                    or existing["cwd"] != cwd
+                    or existing["role"] != ROLE
+                ):
+                    _quarantine(root, grant_path, "active grant attribution mismatch")
+                    raise BridgeError("the active grant attribution is invalid")
+                if existing["expires_at"] <= now:
+                    grant_path.unlink()
+                    _fsync_directory(grant_path.parent)
+                    prompt_context = (
+                        "The explicit DeepSeek delegation grant for this user turn "
+                        "has expired. Do not spawn deepseek_evidence_worker."
+                    )
+                # Otherwise this is an idempotent replay while the one existing
+                # grant is active. Never refresh its id or expiry.
+            else:
+                _atomic_write(grant_path, grant)
+
+        _emit_user_prompt_context(prompt_context)
+    except (BridgeError, OSError) as error:
+        _emit_user_prompt_context(
+            f"DeepSeek delegation was not authorized: {error}. "
+            "Do not spawn deepseek_evidence_worker in this turn."
+        )
 
 
 def _pretool_use(hook: dict[str, Any]) -> None:
@@ -520,60 +833,112 @@ def _pretool_use(hook: dict[str, Any]) -> None:
         return
 
     try:
-        if hook.get("tool_name") != "spawn_agent":
-            raise BridgeError("target worker must be spawned through the Agent tool")
-        if tool_input.get("fork_turns") != "none":
-            raise BridgeError('deepseek_evidence_worker requires explicit fork_turns="none"')
-        permission_mode = _canonical_id(
-            hook.get("permission_mode"), "permission_mode", maximum=64
-        )
-        if permission_mode == "bypassPermissions":
-            raise BridgeError("deepseek_evidence_worker is disabled under bypassPermissions")
-        assignment = tool_input.get("message")
-        if not isinstance(assignment, str) or not assignment.strip():
-            raise BridgeError("the delegated assignment must be a non-empty string")
-        try:
-            assignment_bytes = assignment.encode("utf-8")
-        except UnicodeEncodeError as error:
-            raise BridgeError("the delegated assignment is not valid UTF-8 text") from error
-        if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", assignment):
-            raise BridgeError("the delegated assignment contains unsupported control characters")
-        if len(assignment_bytes) > MAX_ASSIGNMENT_BYTES:
-            raise BridgeError(
-                f"the delegated assignment exceeds {MAX_ASSIGNMENT_BYTES} UTF-8 bytes; pass large inputs by path"
-            )
         session_id = _canonical_id(hook.get("session_id"), "session_id")
         parent_turn_id = _canonical_id(hook.get("turn_id"), "turn_id")
-        tool_use_id = _canonical_id(hook.get("tool_use_id"), "tool_use_id")
-        task_name = _canonical_id(tool_input.get("task_name"), "task_name")
         cwd = _normalized_cwd(hook.get("cwd"))
+        grant_key = _grant_key(session_id, parent_turn_id, cwd)
         key_hash = _reservation_key(session_id, cwd)
         now = time.time()
-        ttl = _ttl_seconds()
-        handoff_id = str(uuid.uuid4())
-        reservation = {
-            "schema": SCHEMA,
-            "bridge_protocol": PROTOCOL,
-            "handoff_id": handoff_id,
-            "key_hash": key_hash,
-            "session_id": session_id,
-            "parent_turn_id": parent_turn_id,
-            "cwd": cwd,
-            "role": ROLE,
-            "task_name": task_name,
-            "tool_use_id": tool_use_id,
-            "permission_mode": permission_mode,
-            "created_at": now,
-            "expires_at": now + ttl,
-            "assignment_utf8_bytes": len(assignment_bytes),
-            "assignment_sha256": hashlib.sha256(assignment_bytes).hexdigest(),
-            "assignment": assignment,
-        }
         root = state_root()
+        grant_path = root / "grants" / f"{grant_key}.json"
+        consumed_path = root / "consumed-grants" / f"{grant_key}.json"
         reservation_path = root / "reservations" / f"{key_hash}.json"
         with _state_lock(root):
             _cleanup_receipts(root, now)
-            _sweep_expired(root, now, exclude=reservation_path)
+            _sweep_expired(root, now, exclude=grant_path)
+            if consumed_path.exists():
+                try:
+                    consumed = _read_consumed_grant(consumed_path, now=now)
+                except InvalidReservation as error:
+                    raise BridgeError(
+                        "the consumed-grant record is invalid and remains blocking at its exact key; "
+                        "inspect status and explicitly resolve-consumed before retrying"
+                    ) from error
+                if (
+                    consumed["key_hash"] != grant_key
+                    or consumed["session_id"] != session_id
+                    or consumed["parent_turn_id"] != parent_turn_id
+                    or consumed["cwd"] != cwd
+                    or consumed["role"] != ROLE
+                ):
+                    raise BridgeError(
+                        "the consumed-grant attribution is invalid and remains blocking at its "
+                        "exact key; explicitly resolve-consumed before retrying"
+                    )
+                raise BridgeError(
+                    "the explicit DeepSeek delegation grant for this user turn was already consumed"
+                )
+            if not grant_path.exists():
+                raise BridgeError(
+                    f"DeepSeek delegation requires {DELEGATION_TOKEN} as the first token of the current user prompt"
+                )
+            try:
+                grant = _validate_grant(_read_json(grant_path), now=now)
+            except InvalidReservation as error:
+                _quarantine(root, grant_path, str(error))
+                raise BridgeError(
+                    "the explicit delegation grant was invalid and quarantined"
+                ) from error
+            if (
+                grant["key_hash"] != grant_key
+                or grant["session_id"] != session_id
+                or grant["parent_turn_id"] != parent_turn_id
+                or grant["cwd"] != cwd
+                or grant["role"] != ROLE
+            ):
+                _quarantine(root, grant_path, "grant attribution mismatch")
+                raise BridgeError("the explicit delegation grant attribution is invalid")
+            if grant["expires_at"] <= now:
+                grant_path.unlink()
+                raise BridgeError("the explicit delegation grant expired; invoke the skill again")
+
+            # Validate the model-authored spawn only after direct user authority
+            # has been established for this exact parent turn.
+            if hook.get("tool_name") != "spawn_agent":
+                raise BridgeError("target worker must be spawned through the Agent tool")
+            if tool_input.get("fork_turns") != "none":
+                raise BridgeError('deepseek_evidence_worker requires explicit fork_turns="none"')
+            permission_mode = _canonical_id(
+                hook.get("permission_mode"), "permission_mode", maximum=64
+            )
+            if permission_mode == "bypassPermissions":
+                raise BridgeError("deepseek_evidence_worker is disabled under bypassPermissions")
+            assignment = tool_input.get("message")
+            if not isinstance(assignment, str) or not assignment.strip():
+                raise BridgeError("the delegated assignment must be a non-empty string")
+            try:
+                assignment_bytes = assignment.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise BridgeError("the delegated assignment is not valid UTF-8 text") from error
+            if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", assignment):
+                raise BridgeError(
+                    "the delegated assignment contains unsupported control characters"
+                )
+            if len(assignment_bytes) > MAX_ASSIGNMENT_BYTES:
+                raise BridgeError(
+                    f"the delegated assignment exceeds {MAX_ASSIGNMENT_BYTES} UTF-8 bytes; pass large inputs by path"
+                )
+            tool_use_id = _canonical_id(hook.get("tool_use_id"), "tool_use_id")
+            task_name = _canonical_id(tool_input.get("task_name"), "task_name")
+            handoff_id = str(uuid.uuid4())
+            reservation = {
+                "schema": SCHEMA,
+                "bridge_protocol": PROTOCOL,
+                "handoff_id": handoff_id,
+                "key_hash": key_hash,
+                "session_id": session_id,
+                "parent_turn_id": parent_turn_id,
+                "cwd": cwd,
+                "role": ROLE,
+                "task_name": task_name,
+                "tool_use_id": tool_use_id,
+                "permission_mode": permission_mode,
+                "created_at": now,
+                "expires_at": now + _ttl_seconds(),
+                "assignment_utf8_bytes": len(assignment_bytes),
+                "assignment_sha256": hashlib.sha256(assignment_bytes).hexdigest(),
+                "assignment": assignment,
+            }
             if reservation_path.exists():
                 try:
                     existing = _validate_reservation(_read_json(reservation_path), now=now)
@@ -588,7 +953,24 @@ def _pretool_use(hook: dict[str, Any]) -> None:
                     )
                 _write_receipt(root, _receipt_from_reservation(existing, "expired"))
                 reservation_path.unlink()
-            _atomic_write(reservation_path, reservation)
+
+            # Persist the body-free terminal record before erasing authority.
+            # Once this succeeds, every later path treats the grant as consumed,
+            # including crashes before the active file or reservation is updated.
+            _atomic_write(
+                consumed_path,
+                _consumed_grant_from_grant(grant, now=now),
+            )
+            try:
+                grant_path.unlink()
+                _fsync_directory(grant_path.parent)
+                _atomic_write(reservation_path, reservation)
+            except OSError:
+                # The tombstone remains terminal. A failed dispatch must not
+                # leave a replayable assignment or active authority behind.
+                reservation_path.unlink(missing_ok=True)
+                _fsync_directory(reservation_path.parent)
+                raise
 
         updated_input = dict(tool_input)
         updated_input["message"] = (
@@ -704,7 +1086,7 @@ def _subagent_start(hook: dict[str, Any]) -> None:
     try:
         _emit_subagent_context(context)
     except OSError as error:
-        print(f"codex-deepseek-bridge: SubagentStart output failed: {error}", file=sys.stderr)
+        print(f"codex-deepseek-subagent: SubagentStart output failed: {error}", file=sys.stderr)
 
 
 def hook_mode() -> None:
@@ -716,7 +1098,9 @@ def hook_mode() -> None:
         _deny(str(error))
         return
     event = hook.get("hook_event_name")
-    if event == "PreToolUse":
+    if event == "UserPromptSubmit":
+        _user_prompt_submit(hook)
+    elif event == "PreToolUse":
         _pretool_use(hook)
     elif event == "SubagentStart":
         _subagent_start(hook)
@@ -727,11 +1111,39 @@ def _redacted_state(root: Path) -> dict[str, Any]:
     result: dict[str, Any] = {
         "bridge_protocol": PROTOCOL,
         "state_root": str(root),
+        "grants": [],
+        "consumed_grants": [],
         "reservations": [],
         "claims": [],
         "receipts": [],
         "quarantine": [],
     }
+    for path in sorted((root / "grants").glob("*.json")):
+        try:
+            value = _read_json(path)
+            item = {
+                "grant_id": value.get("grant_id"),
+                "status": "available",
+                "key_hash": value.get("key_hash"),
+                "created_at": value.get("created_at"),
+                "expires_at": value.get("expires_at"),
+                "expired": bool(value.get("expires_at", now + 1) <= now),
+            }
+        except (BridgeError, OSError):
+            item = {"status": "unreadable", "file": path.name}
+        result["grants"].append(item)
+    for path in sorted((root / "consumed-grants").glob("*.json")):
+        try:
+            value = _read_consumed_grant(path, now=now)
+            item = {
+                "grant_id": value.get("grant_id"),
+                "status": "consumed",
+                "key_hash": value.get("key_hash"),
+                "consumed_at": value.get("consumed_at"),
+            }
+        except (BridgeError, OSError):
+            item = {"status": "unreadable", "file": path.name}
+        result["consumed_grants"].append(item)
     for label, folder in (
         ("reservations", "reservations"),
         ("claims", "claims"),
@@ -836,8 +1248,26 @@ def resolve_mode(quarantine_id: str) -> None:
     _emit({"resolved": removed, "quarantine_id": quarantine_id})
 
 
+def resolve_consumed_mode(key_hash: str) -> None:
+    if not isinstance(key_hash, str) or re.fullmatch(r"[0-9a-f]{64}", key_hash) is None:
+        raise BridgeError("key_hash must be exactly 64 lowercase hexadecimal characters")
+    root = state_root()
+    path = root / "consumed-grants" / f"{key_hash}.json"
+    removed = False
+    with _state_lock(root):
+        try:
+            path.unlink()
+            _fsync_directory(path.parent)
+            removed = True
+        except FileNotFoundError:
+            pass
+    _emit({"resolved": removed, "key_hash": key_hash})
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Codex DeepSeek automatic task bridge")
+    parser = argparse.ArgumentParser(
+        description="Codex DeepSeek explicitly authorized task bridge"
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("hook")
     subparsers.add_parser("doctor")
@@ -846,6 +1276,8 @@ def main() -> None:
     cancel.add_argument("--handoff-id", required=True)
     resolve = subparsers.add_parser("resolve")
     resolve.add_argument("--quarantine-id", required=True)
+    resolve_consumed = subparsers.add_parser("resolve-consumed")
+    resolve_consumed.add_argument("--key-hash", required=True)
     arguments = parser.parse_args()
 
     try:
@@ -859,8 +1291,10 @@ def main() -> None:
             cancel_mode(arguments.handoff_id)
         elif arguments.command == "resolve":
             resolve_mode(arguments.quarantine_id)
+        elif arguments.command == "resolve-consumed":
+            resolve_consumed_mode(arguments.key_hash)
     except (BridgeError, OSError) as error:
-        print(f"codex-deepseek-bridge: {error}", file=sys.stderr)
+        print(f"codex-deepseek-subagent: {error}", file=sys.stderr)
         raise SystemExit(12) from error
 
 

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Delegate DeepSeek Evidence Work"
-  short_description: "Route bounded read-only evidence work to DeepSeek"
-  default_prompt: "Use $delegate-deepseek-work to delegate this bounded log analysis to the DeepSeek evidence worker."

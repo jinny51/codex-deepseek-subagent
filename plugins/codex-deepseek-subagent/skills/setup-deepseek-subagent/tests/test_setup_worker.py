@@ -81,7 +81,7 @@ class SetupWorkerTests(unittest.TestCase):
         all_files = [path for path in self.codex_home.rglob("*") if path.is_file()]
         self.assertEqual(all_files, [self.target])
         content = self.target.read_text(encoding="utf-8")
-        self.assertTrue(content.startswith("# codex-deepseek-bridge: managed-agent/v1\n"))
+        self.assertTrue(content.startswith("# codex-deepseek-subagent: managed-agent/v1\n"))
         self.assertIn("payload_sha256", content.splitlines()[1])
 
         doctor, doctor_result = self.run_command("doctor", key=True)
@@ -136,7 +136,7 @@ class SetupWorkerTests(unittest.TestCase):
         manifest["payload_sha256"] = hashlib.sha256(older_payload.encode("utf-8")).hexdigest()
         older_managed_file = (
             header
-            + "\n# codex-deepseek-bridge-ownership: "
+            + "\n# codex-deepseek-subagent-ownership: "
             + json.dumps(manifest, separators=(",", ":"), sort_keys=True)
             + "\n"
             + blank

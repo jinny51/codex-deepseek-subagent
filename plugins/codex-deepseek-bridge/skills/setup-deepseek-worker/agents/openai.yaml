@@ -1,4 +1,0 @@
-interface:
-  display_name: "Set Up DeepSeek Evidence Worker"
-  short_description: "Install, inspect, or remove the managed worker"
-  default_prompt: "Use $setup-deepseek-worker to inspect and install the managed DeepSeek evidence worker."
