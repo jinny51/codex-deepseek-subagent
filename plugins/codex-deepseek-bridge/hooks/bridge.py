@@ -57,7 +57,10 @@ class InvalidReservation(BridgeError):
 
 
 def _compact_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    # Hook stdout can inherit a legacy Windows console encoding such as cp1252.
+    # ASCII-safe JSON preserves the original Unicode after parsing while making
+    # every lifecycle response portable across Windows, WSL, macOS, and Linux.
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
 
 
 def _emit(value: Any) -> None:

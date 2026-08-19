@@ -148,12 +148,14 @@ class BridgeTests(unittest.TestCase):
     def test_round_trip_uses_json_context_and_leaves_body_free_receipt(self):
         assignment = 'Inspect logs containing "END" and return only evidence.\n第二行'
         pre = self.invoke("hook", self.pre_input(assignment))
+        self.assertTrue(pre.stdout.isascii())
         decision = self.pre_decision(pre)
         self.assertEqual(decision["permissionDecision"], "allow")
         self.assertNotIn(assignment, pre.stdout)
         handoff_id = self.extract_handoff_id(decision)
 
         started = self.invoke("hook", self.start_input())
+        self.assertTrue(started.stdout.isascii())
         context = self.child_context(started)
         self.assertEqual(context["bridge_protocol"], PROTOCOL)
         self.assertEqual(context["status"], "ready")
