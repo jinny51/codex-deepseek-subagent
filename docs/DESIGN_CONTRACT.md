@@ -36,7 +36,7 @@
 4. **一个 child 只接收一个自洽 job。** assignment 应包含目标、范围、排除项、证据要求和停止条件。
 5. **保留 Codex 原生生命周期。** spawn、权限、取消、等待和 callback 不能被直接 API、MCP、daemon 或第二个 CLI 替代。
 6. **传输失败必须 fail closed。** 不猜任务，不静默重放，不换模型，不继承根历史冒充成功。
-7. **正确归属优先于吞吐。** 无法证明关联时，不允许多个同 session/turn/role 的 reservation 并行竞争。
+7. **正确归属优先于吞吐。** 无法证明关联时，不允许多个同 parent-session/cwd/role 的 reservation 并行竞争。
 8. **凭据与任务分离。** API key 不得进入 assignment、Hook 状态、聊天、日志或普通配置正文。
 9. **只读不是保密边界。** 文件不能修改，不等于内容不会发送给外部 Provider。
 10. **用户决定信任。** 插件和安装器不得伪造 Hook trust。

@@ -1,0 +1,20 @@
+{
+  "name": "jinny51-codex",
+  "interface": {
+    "displayName": "Jinny51 Codex"
+  },
+  "plugins": [
+    {
+      "name": "codex-deepseek-bridge",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-deepseek-bridge"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

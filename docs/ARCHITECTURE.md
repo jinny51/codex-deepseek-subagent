@@ -25,7 +25,8 @@ PreToolUse（匹配 Agent）
   - 只处理目标 role
   - 检查 fork_turns=none
   - 检查 assignment 大小和当前权限模式
-  - 按 session + turn + cwd 建立 reservation
+  - 按 parent session + cwd + role 建立 reservation
+  - 记录 parent turn/tool_use_id 供审计，不拿 parent turn 做 child lookup
   - 失败时 deny，spawn 不发生
              │
              ▼
@@ -33,7 +34,7 @@ Codex 创建原生 DeepSeek child
              │
              ▼
 SubagentStart（匹配目标 role）
-  - 领取相同 session + turn + cwd 的 reservation
+  - 领取相同 parent session + cwd + role 的 reservation
   - 校验摘要、TTL 和身份
   - 注入 developer context
   - 擦除 assignment，保留无正文 receipt
@@ -47,14 +48,16 @@ Codex 原生 wait / cancel / callback
 
 ## 为什么不再手工 stage
 
-当前 Codex 会让 `spawn_agent` 经过 `PreToolUse`，并向 Hook 提供原始参数、父 `session_id`、`turn_id`、`tool_use_id` 和 `cwd`。因此桥接可以在真正 spawn 之前自动捕获 assignment；无需让模型执行一条额外 shell 命令，也无需使用跨任务共享的全局 pending 槽。
+当前 Codex 会让 `spawn_agent` 经过 `PreToolUse`，并向 Hook 提供原始参数、父 `session_id`、父 `turn_id`、`tool_use_id` 和 `cwd`。因此桥接可以在真正 spawn 之前自动捕获 assignment；无需让模型执行一条额外 shell 命令，也无需使用跨 session 共享的全局 pending 槽。
+
+`SubagentStart` 的 `turn_id` 属于 child 新提交的 turn，并不等于父 `turn_id`。所以 delivery lookup 只能使用官方明确共享的父 session，再结合规范化 cwd 和 exact role。父 turn 和 tool-use ID 只进入 envelope/receipt 用于诊断。
 
 ## 关联模型
 
 Reservation 的最小身份包含：
 
 - `session_id`
-- `turn_id`
+- `parent_turn_id`（仅审计）
 - `cwd` 的规范化摘要
 - 目标 `agent_type`
 - 父 `tool_use_id`
@@ -62,19 +65,21 @@ Reservation 的最小身份包含：
 - 创建与过期时间
 - assignment 的 UTF-8 长度和 SHA-256
 
-`SubagentStart` 当前不提供父 `tool_use_id`，所以同一个 session、turn 和 role 同时只允许一个未领取 reservation。不同 session 可以并行；已经领取任务的 workers 不持有 dispatch lock，可以继续并行执行。
+`SubagentStart` 当前不提供父 `turn_id`、`tool_use_id` 或 `task_name`，所以同一个 parent-session/cwd/role 同时只允许一个未领取 reservation。不同 session 可以并行；已经领取任务的 workers 不持有 dispatch lock，可以继续并行执行。
 
 ## 状态机
 
 ```text
-captured -> claimed -> delivered -> receipt
-    │          │
-    └-> expired/quarantine <- invalid
+captured -> claimed -> delivery_committed -> stdout attempt
+    │          │              │
+    └-> expired/quarantine    └-> body-free receipt
+                ↑
+              invalid
 ```
 
 - `captured`：PreToolUse 已验证 assignment，spawn 尚未开始。
 - `claimed`：SubagentStart 已原子取得 reservation。
-- `delivered`：developer context 已成功写出，assignment 立即删除。
+- `delivery_committed`：body-free receipt 已持久化且 assignment 已删除；之后才尝试写 Hook stdout。它表示 at-most-once 提交，不声称 child 或 Provider 一定观察到了内容。
 - `receipt`：只保留 ID、哈希、大小、身份和时间，不保留正文。
 - `quarantine`：结构或摘要不合法，必须显式检查，不自动覆盖。
 

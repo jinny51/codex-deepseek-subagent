@@ -4,7 +4,7 @@
 
 - DeepSeek API key。
 - 父 Agent 交给 worker 的 assignment。
-- assignment 与具体 Codex session/turn 的正确归属。
+- assignment 与具体 Codex 父 session、工作目录和目标 role 的正确归属。
 - 用户现有 Codex 配置和其他插件。
 
 ## 信任边界
@@ -18,7 +18,7 @@
 
 - API key 只由自定义 Provider 从环境变量读取。
 - PreToolUse 在写状态失败、assignment 超限、身份冲突或不安全权限模式下阻止 spawn。
-- Reservation 绑定父 session、turn、cwd 和目标 role。
+- Reservation 绑定父 session、规范化 cwd 和目标 role；父 turn 只记录为审计元数据，因为 child 会获得新的 turn id。
 - 状态使用操作系统锁、原子替换、短 TTL 和内容摘要。
 - POSIX 状态目录必须实际支持私有 mode 和锁；WSL 的 DrvFS/CIFS 等宽权限目录不能仅凭 `chmod` 成功就视为安全。
 - SubagentStart 缺少有效 reservation 时只注入安全失败状态；worker 不得猜测任务或调用工具。

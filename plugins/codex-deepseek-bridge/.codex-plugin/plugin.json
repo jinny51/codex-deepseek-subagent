@@ -1,0 +1,28 @@
+{
+  "name": "codex-deepseek-bridge",
+  "version": "0.1.0",
+  "description": "Delegate bounded read-heavy work from an OpenAI Codex parent to a DeepSeek child without changing the parent provider.",
+  "author": {
+    "name": "jinny",
+    "url": "https://github.com/jinny51"
+  },
+  "homepage": "https://github.com/jinny51/codex-deepseek-bridge",
+  "repository": "https://github.com/jinny51/codex-deepseek-bridge",
+  "license": "MIT",
+  "keywords": ["codex", "deepseek", "subagent", "delegation"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex DeepSeek Bridge",
+    "shortDescription": "DeepSeek delegation for Codex",
+    "longDescription": "Keeps the OpenAI parent in control while a dedicated DeepSeek child handles bounded, read-heavy text work through Codex native subagent lifecycle. The bridge writes short-lived local handoff state, and the setup Skill can install or remove one managed personal Agent file.",
+    "developerName": "jinny",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/jinny51/codex-deepseek-bridge",
+    "defaultPrompt": [
+      "Set up the DeepSeek worker for this plugin.",
+      "Delegate this bounded log analysis to the DeepSeek worker."
+    ],
+    "brandColor": "#315C9B"
+  }
+}
