@@ -1,6 +1,6 @@
 {
   "name": "codex-deepseek-subagent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Delegate bounded read-heavy work from an OpenAI Codex parent to a DeepSeek child without changing the parent provider.",
   "author": {
     "name": "jinny",
