@@ -1,0 +1,7 @@
+interface:
+  display_name: "Use DeepSeek Subagent"
+  short_description: "Route bounded read-only evidence work to DeepSeek"
+  default_prompt: "$use-deepseek-subagent Analyze this bounded log set with the DeepSeek evidence worker."
+
+policy:
+  allow_implicit_invocation: false
