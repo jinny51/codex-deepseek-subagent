@@ -1,4 +1,15 @@
-# Security
+# Security / 安全说明
+
+## 中文摘要
+
+- 不要把 API key 放进聊天、仓库、截图、Issue、日志或 Agent TOML。只要 key 曾经暴露，就应立即撤销并重新生成。
+- 安装插件不会全局开启 DeepSeek。只有当前消息的第一个完整单词是 `$use-deepseek-subagent` 时，本条消息才有一次授权。
+- 任务说明、DeepSeek 读取的必要文件内容和工具结果会发送给 DeepSeek；默认只读不等于保密。
+- 任务交接时会短暂写入本地明文。正常交接后正文删除；损坏文件可能进入隔离区并保留到用户明确处理。
+- 三个 Hook 必须可用、经过用户审查并信任。任何一个缺失或未信任，都应停止委派，不能绕过保护。
+- 发现安全漏洞时，请使用 GitHub 的[私密漏洞报告](https://github.com/jinny51/codex-deepseek-subagent/security/advisories/new)，不要在公开 Issue 中粘贴利用细节、key、任务正文或私人路径。
+
+## English
 
 ## API keys
 
@@ -40,4 +51,4 @@ All three plugin command Hooks remain untrusted until the user reviews their exa
 
 ## Reports
 
-Security reports must exclude API keys, authorization headers, full environment dumps, private task contents, and unredacted local paths. Rotate an exposed credential before investigating the underlying bug.
+Report vulnerabilities privately through [GitHub Private Vulnerability Reporting](https://github.com/jinny51/codex-deepseek-subagent/security/advisories/new). Do not open a public issue containing exploit details, API keys, authorization headers, full environment dumps, private task contents, or unredacted local paths. Rotate an exposed credential before investigating the underlying bug.
